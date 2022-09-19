@@ -16,6 +16,7 @@ typedef struct _AppContext
     GstElement *pipeline;
 
     GstElement *app_src;
+    GstElement *demux;
     GstElement *h264parse;
     GstElement *nvv4l2decoder;
     GstElement *nveglglessink;
@@ -27,6 +28,30 @@ typedef struct _AppContext
 
     FILE *file;
 }AppContext;
+
+static void
+demux_newpad (GstElement *demux, GstPad *demux_src_pad, gpointer data)
+{
+  GstCaps *caps = gst_pad_get_current_caps (demux_src_pad);
+  if (!caps)
+  {
+    caps = gst_pad_query_caps (demux_src_pad, NULL);
+  }
+  const GstStructure *str = gst_caps_get_structure (caps, 0);
+  const gchar *name = gst_structure_get_name (str);
+
+  if (!strncmp (name, "video", 5))
+  {
+      GstElement *parser = (GstElement *) data;
+      GstPad *sinkpad = gst_element_get_static_pad (parser, "sink");
+      if (gst_pad_link (demux_src_pad, sinkpad) != GST_PAD_LINK_OK)
+      {
+          printf ("failed to link demux SRC pad to video pipeline\n");
+      }
+      gst_object_unref(sinkpad);
+      printf ("demux pad is linked to downstream video pipeline successfully\n");
+  }
+}
 
 
 static gboolean read_data (AppContext *app)
@@ -149,6 +174,7 @@ int main (int argc, char *argv[])
     app.data_ptr = (guint8 *) g_malloc0(BUFF_SIZE);
 
     app.app_src = gst_element_factory_make ("appsrc", "app_source");
+    app.demux = gst_element_factory_make ("matroskademux", "demux");
     app.h264parse = gst_element_factory_make ("h264parse", "parser");
     app.nvv4l2decoder = gst_element_factory_make ("nvv4l2decoder", "decoder");
     app.nveglglessink = gst_element_factory_make ("nveglglessink", "sink");
@@ -159,28 +185,36 @@ int main (int argc, char *argv[])
     g_signal_connect (app.app_src, "need-data", G_CALLBACK (start_feed), &app);
     g_signal_connect (app.app_src, "enough-data", G_CALLBACK (stop_feed), &app);
 
+    g_object_set (G_OBJECT(app.nveglglessink), "sync", 0, NULL);
 
-    if (!app.pipeline || ! app.app_src || !app.h264parse || !app.nvv4l2decoder || !app.nveglglessink)
+    if (!app.pipeline || ! app.app_src || !app.demux  || !app.h264parse || !app.nvv4l2decoder || !app.nveglglessink)
     {
         g_printerr ("Not all elements could be created.\n");
         return -1;
     }
-
 
     bus = gst_element_get_bus (app.pipeline);
     gst_bus_add_signal_watch (bus);
     g_signal_connect (G_OBJECT (bus), "message::error", (GCallback)error_cb, &app);
     gst_object_unref (bus);
 
-    gst_bin_add_many (GST_BIN(app.pipeline), app.app_src, app.h264parse, app.nvv4l2decoder, app.nveglglessink, NULL);
+    gst_bin_add_many (GST_BIN(app.pipeline), app.app_src, app.demux, app.h264parse, app.nvv4l2decoder, app.nveglglessink, NULL);
 
-    if (gst_element_link_many (app.app_src, app.h264parse, app.nvv4l2decoder, app.nveglglessink, NULL) != TRUE)
+    g_signal_connect (app.demux, "pad-added", G_CALLBACK (demux_newpad), app.h264parse);
+
+    if (gst_element_link_many (app.app_src, app.demux, NULL) != TRUE)
     {
         g_printerr ("Failed to link elements in the pipeline\n");
         gst_object_unref (app.pipeline);
         return -1;
     }
 
+    if (gst_element_link_many (app.h264parse, app.nvv4l2decoder, app.nveglglessink, NULL) != TRUE)
+    {
+        g_printerr ("Failed to link elements in the pipeline\n");
+        gst_object_unref (app.pipeline);
+        return -1;
+    }
 
     gst_element_set_state (app.pipeline, GST_STATE_PLAYING);
 
