@@ -1,13 +1,51 @@
-//gcc --std=c99 -Wall $(pkg-config --cflags gstreamer-1.0) gstappsrc.cpp $(pkg-config --libs gstreamer-1.0) -lgstapp-1.0
+//gcc -Wall $(pkg-config --cflags gstreamer-1.0) gstappsrc.cpp $(pkg-config --libs gstreamer-1.0) -lgstapp-1.0
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <glib.h>
+#include <sys/time.h>
 
 #include <stdint.h>
 
 GMainLoop *loop = NULL;
 
 #define BATCH 32
+
+typedef struct _srcbinctx
+{
+    GQueue *queue;
+    struct timeval start;
+}srcbinctx;
+
+GstPadProbeReturn decoder_sinkpad_probe_callback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+    srcbinctx *sbc = (srcbinctx *)user_data;
+
+    gettimeofday (&sbc->start, NULL);
+
+    g_queue_push_head (sbc->queue, &sbc->start);
+    return GST_PAD_PROBE_OK;
+}
+
+GstPadProbeReturn decoder_srcpad_probe_callback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+    srcbinctx *sbc = (srcbinctx *)user_data;
+    struct timeval *s;
+    struct timeval start, end;
+
+    gettimeofday (&end, NULL);
+
+    if (!g_queue_is_empty (sbc->queue))
+    {
+        s = (timeval *) g_queue_pop_tail (sbc->queue);
+
+        start = *s;
+
+        g_print("latency = %ld ms for decoder %p inside probe function\n", ((end.tv_sec * 1000000 + end.tv_usec)
+                    - (start.tv_sec * 1000000 + start.tv_usec)) / 1000, gst_pad_get_parent_element(pad));
+    }
+    return GST_PAD_PROBE_OK;
+}
 
 static gboolean bus_call (GstBus * bus, GstMessage * msg, gpointer data)
 {
@@ -51,9 +89,13 @@ static gboolean bus_call (GstBus * bus, GstMessage * msg, gpointer data)
 
 static GstElement *create_source_bin (guint index, gchar *filename)
 {
-    GstElement *bin = NULL, *source = NULL, *jpegparse = NULL, *jpegdec = NULL;
+    GstElement *bin = NULL, *source = NULL, *jpegparse = NULL, *jpegdec = NULL, *nvvideoconvert = NULL;
     gchar bin_name[16] = { };
     gchar appsrc_name[16] = { };
+    GstPad *pad;
+
+    srcbinctx *sbc = (srcbinctx *) malloc (sizeof(srcbinctx));
+    sbc->queue = g_queue_new ();
 
     g_snprintf (bin_name, 15, "source-bin-%02d", index);
     bin = gst_bin_new (bin_name);
@@ -63,17 +105,27 @@ static GstElement *create_source_bin (guint index, gchar *filename)
 
     jpegparse = gst_element_factory_make ("jpegparse", NULL);
 
-    jpegdec = gst_element_factory_make ("nvjpegdec", NULL);
+    jpegdec = gst_element_factory_make ("nvimagedec", NULL);
+    
+    nvvideoconvert = gst_element_factory_make ("nvvideoconvert", NULL);
 
-    if (!bin || !source || !jpegparse || !jpegdec)
+    if (!bin || !source || !jpegparse || !jpegdec || !nvvideoconvert)
     {
         g_printerr ("One element in source bin could not be created.\n");
         return NULL;
     }
 
-    gst_bin_add_many (GST_BIN (bin), source, jpegparse, jpegdec, NULL);
+#if 1
+    pad = gst_element_get_static_pad(jpegdec, "sink");
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, decoder_sinkpad_probe_callback, sbc, NULL);
+    
+    pad = gst_element_get_static_pad(jpegdec, "src");
+    gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, decoder_srcpad_probe_callback, sbc, NULL);
+#endif
 
-    if (!gst_element_link_many (source, jpegparse, jpegdec, NULL))
+    gst_bin_add_many (GST_BIN (bin), source, jpegparse, jpegdec, nvvideoconvert, NULL);
+
+    if (!gst_element_link_many (source, jpegparse, jpegdec, nvvideoconvert, NULL))
     {
         g_printerr ("Failed to link source_bin elements\n");
         return NULL;
@@ -81,10 +133,10 @@ static GstElement *create_source_bin (guint index, gchar *filename)
 
     /* We need to create a ghost pad for the source bin which acts as a proxy for
      * the decoder src pad */
-    GstPad *gstpad = gst_element_get_static_pad (jpegdec, "src");
+    GstPad *gstpad = gst_element_get_static_pad (nvvideoconvert, "src");
     if (!gstpad)
     {
-        g_printerr ("could not create pad for jpegdec");
+        g_printerr ("could not get src pad of nvvideoconvert ");
         return NULL;
     }
 
@@ -183,7 +235,7 @@ gint main (gint argc, gchar *argv[])
             }
         }
 
-        //g_usleep (5000000);
+        g_usleep (5000000);
     }
 
     /* play */
